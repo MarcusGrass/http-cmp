@@ -12,9 +12,9 @@ use std::task::{Context, Poll};
 pub struct TokioUringExecutor;
 
 impl<Fut> Executor<Fut> for TokioUringExecutor
-    where
-        Fut: Future + Send + 'static,
-        Fut::Output: Send + 'static,
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
 {
     #[inline]
     fn execute(&self, fut: Fut) {
@@ -25,7 +25,7 @@ impl<Fut> Executor<Fut> for TokioUringExecutor
 pin_project! {
     pub struct UringTcp {
         inner_tcp: Rc<tokio_uring::net::TcpStream>,
-        read_buf: Option<OutgoingWriteBuffer>,
+        read_buf: OutgoingBuffers,
         #[pin]
         read_fut: Option<Pin<Box<dyn Future<Output=Result<OutgoingWriteBuffer, std::io::Error>>>>>,
         write_buf: Option<BufferedBytesMut>,
@@ -39,10 +39,7 @@ impl UringTcp {
     pub fn new(inner_tcp: tokio_uring::net::TcpStream, buf_size: usize) -> Self {
         Self {
             inner_tcp: Rc::new(inner_tcp),
-            read_buf: Some(OutgoingWriteBuffer {
-                bytes: BytesMut::zeroed(buf_size),
-                unread_range: None,
-            }),
+            read_buf: OutgoingBuffers::new(BytesMut::zeroed(buf_size), BytesMut::zeroed(buf_size)),
             read_fut: None,
             write_buf: Some(BufferedBytesMut {
                 bytes: BytesMut::zeroed(buf_size),
@@ -65,11 +62,17 @@ impl OutgoingBuffers {
         Self {
             writing: Some(OutgoingWriteBuffer {
                 bytes: left,
-                unread_range: None,
+                unread_range: UnreadRange {
+                    start: 0,
+                    count: 0,
+                },
             }),
             buffer: OutgoingWriteBuffer {
                 bytes: right,
-                unread_range: None,
+                unread_range: UnreadRange {
+                    start: 0,
+                    count: 0,
+                },
             },
         }
     }
@@ -90,7 +93,6 @@ impl OutgoingBuffers {
                 return None;
             }
             return Some(written);
-
         }
         None
     }
@@ -99,14 +101,17 @@ impl OutgoingBuffers {
         self.writing.take().unwrap()
     }
 
-    fn merge_back(&mut self, prev_writing: OutgoingWriteBuffer) {
+    fn merge_back(&mut self, prev_writing: OutgoingWriteBuffer) -> bool {
         if prev_writing.unwritten() {
             // Did not manage to write the old buffer completely
             self.writing = Some(prev_writing);
+            true
         } else {
             // Managed to write the old buffer completely, swap in the waiting one
             let new_writing = std::mem::replace(&mut self.buffer, prev_writing);
+            let has_rem = new_writing.unwritten();
             self.writing = Some(new_writing);
+            has_rem
         }
     }
 }
@@ -120,32 +125,23 @@ struct QueueBuffer {
 #[derive(Debug)]
 struct OutgoingWriteBuffer {
     bytes: BytesMut,
-    unread_range: Option<UnreadRange>,
+    unread_range: UnreadRange,
 }
 
 impl OutgoingWriteBuffer {
     #[inline]
     fn unwritten(&self) -> bool {
-        self.unread_range
-            .as_ref()
-            .map(|r| r.count > 0)
-            .unwrap_or_default()
+        self.unread_range.count > 0
     }
 
     #[inline]
     fn avail_space(&self) -> usize {
-        self.unread_range
-            .as_ref()
-            .map(|r| self.bytes.len() - (r.start + r.count))
-            .unwrap_or_else(|| self.bytes.len())
+        self.bytes.len() - (self.unread_range.start + self.unread_range.count)
     }
 
     #[inline]
     fn space_end(&self) -> usize {
-        self.unread_range
-            .as_ref()
-            .map(|r| r.start + r.count)
-            .unwrap_or_default()
+        self.unread_range.start + self.unread_range.count
     }
 
     fn copy_into(&mut self, source: &[u8]) -> usize {
@@ -154,6 +150,7 @@ impl OutgoingWriteBuffer {
             let space = self.bytes.len() - end;
             let to_write = space.min(source.len());
             self.bytes.as_mut()[end..end + to_write].copy_from_slice(&source[..to_write]);
+            self.unread_range.count += to_write;
             to_write
         } else {
             0
@@ -284,23 +281,26 @@ fn try_write_into_cursor(
     false
 }
 
-fn submit_read(
+fn poll_outgoing(
     tcp: &Rc<tokio_uring::net::TcpStream>,
-    read_buf: &mut Option<OutgoingWriteBuffer>,
-    read_fut: &mut Option<Pin<Box<dyn Future<Output = Result<OutgoingWriteBuffer, std::io::Error>>>>>,
+    read_buf: &mut OutgoingBuffers,
+    read_fut: &mut Option<
+        Pin<Box<dyn Future<Output = Result<OutgoingWriteBuffer, std::io::Error>>>>,
+    >,
     cx: &mut Context<'_>,
 ) -> Poll<Result<bool, Error>> {
-    if read_fut.is_none() {
-        let rf = read_buf.take().unwrap();
-        *read_fut = Some(Box::pin(try_write_to_stream(tcp.clone(), rf)));
-    }
-    let mut fut = read_fut.take().unwrap();
+    let mut fut = if let Some(rf) = read_fut.take() {
+        rf
+    } else {
+        // If no read fut, there should be a ready buffer
+        let buf = read_buf.get_unchecked();
+        Box::pin(try_write_to_stream(tcp.clone(), buf))
+    };
     let pinned = std::pin::pin!(&mut fut);
     match pinned.poll(cx) {
         Poll::Ready(res) => match res {
             Ok(buffered) => {
-                let has_remaining = buffered.unwritten();
-                *read_buf = Some(buffered);
+                let has_remaining = read_buf.merge_back(buffered);
                 Poll::Ready(Ok(has_remaining))
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -318,156 +318,64 @@ impl tokio::io::AsyncWrite for UringTcp {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        match (self.read_buf.is_some(), self.read_fut.is_some()) {
-            (true, false) => {
-                // Write the bytes into the outgoing buffer and send it into the future
-                let mut rf = self.read_buf.take().unwrap();
-                let write_into = buf.len().min(rf.bytes.len());
-                rf.bytes[..write_into].copy_from_slice(&buf[..write_into]);
-                rf.unread_range = Some(UnreadRange {
-                    start: 0,
-                    count: write_into,
-                });
-                self.read_buf = Some(rf);
-                let mut read_fut = None;
-                // If instantly done, keep going. Unlikely to ever happen though
-                loop {
-                    match submit_read(
-                        &self.inner_tcp.clone(),
-                        &mut self.read_buf,
-                        &mut read_fut,
-                        cx,
-                    ) {
-                        Poll::Ready(res) => {
-                            match res {
-                                Ok(has_rem) => {
-                                    if has_rem {
-                                        continue;
-                                    }
-                                    // Signal all bytes that was dumped into the buffer,
-                                    // they still need to be 'flushed' to be sure of write
-                                    break Poll::Ready(Ok(write_into));
-                                }
-                                Err(e) => {
-                                    break Poll::Ready(Err(e));
-                                }
-                            }
-                        }
-                        Poll::Pending => {
-                            *self.project().read_fut = read_fut;
-                            break Poll::Ready(Ok(write_into));
-                        }
+        let mut accumulated_accepted: usize = self.read_buf.write_into_avail(buf).unwrap_or_default();
+        let mut fut = self.read_fut.take();
+        loop {
+            match poll_outgoing(
+                &self.inner_tcp.clone(),
+                &mut self.read_buf,
+                &mut fut,
+                cx,
+            ) {
+                Poll::Ready(res) => match res {
+                    Ok(_has_rem) => {
+                        // Done, try start a new one
+                        accumulated_accepted += self.read_buf.write_into_avail(&buf[accumulated_accepted..]).unwrap_or_default();
+                        continue;
                     }
+                    Err(e) => {
+                        break Poll::Ready(Err(e));
+                    }
+                },
+                Poll::Pending => {
+                    let mut slf = self.project();
+                    *slf.read_fut = fut;
+                    break if accumulated_accepted > 0 {
+                        Poll::Ready(Ok(accumulated_accepted))
+                    } else {
+                        Poll::Pending
+                    };
                 }
             }
-            (false, true) => {
-                let mut read_fut = self.read_fut.take();
-                // If instantly done, keep going. Unlikely to ever happen though
-                let mut accumulated_accepted: usize = 0;
-                loop {
-                    match submit_read(
-                        &self.inner_tcp.clone(),
-                        &mut self.read_buf,
-                        &mut read_fut,
-                        cx,
-                    ) {
-                        Poll::Ready(res) => match res {
-                            Ok(has_rem) => {
-                                if has_rem {
-                                    continue;
-                                }
-                                let mut rf = self.read_buf.take().unwrap();
-                                let write_into = buf.len().min(rf.bytes.len());
-                                rf.bytes[..write_into].copy_from_slice(&buf[..write_into]);
-                                rf.unread_range = Some(UnreadRange {
-                                    start: 0,
-                                    count: write_into,
-                                });
-                                self.read_buf = Some(rf);
-                                accumulated_accepted += write_into;
-                                continue;
-                            }
-                            Err(e) => {
-                                break Poll::Ready(Err(e));
-                            }
-                        },
-                        Poll::Pending => {
-                            let mut slf = self.project();
-                            *slf.read_fut = read_fut;
-                            break if accumulated_accepted > 0 {
-                                Poll::Ready(Ok(accumulated_accepted))
-                            } else {
-                                Poll::Pending
-                            };
-                        }
-                    }
-                }
-            }
-            (a, b) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                anyhow::anyhow!("async write is busy - buf present={a}, fut present={b}"),
-            ))),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        let mut read_fut = self.read_fut.take();
-        match (self.read_buf.is_some(), read_fut.is_some()) {
-            (true, false) => loop {
-                match submit_read(
-                    &self.inner_tcp.clone(),
-                    &mut self.read_buf,
-                    &mut read_fut,
-                    cx,
-                ) {
-                    Poll::Ready(res) => match res {
-                        Ok(has_rem) => {
-                            if has_rem {
-                                continue;
-                            }
-                            break Poll::Ready(Ok(()));
+        let mut fut = self.read_fut.take();
+        loop {
+            match poll_outgoing(
+                &self.inner_tcp.clone(),
+                &mut self.read_buf,
+                &mut fut,
+                cx,
+            ) {
+                Poll::Ready(res) => match res {
+                    Ok(has_rem) => {
+                        if has_rem {
+                            continue
                         }
-                        Err(e) => {
-                            break Poll::Ready(Err(e));
-                        }
-                    },
-                    Poll::Pending => {
-                        *self.project().read_fut = read_fut;
-                        break Poll::Pending;
+                        break Poll::Ready(Ok(()));
                     }
-                }
-            },
-            (false, true) => {
-                // If instantly done, keep going. Unlikely to ever happen though
-                loop {
-                    match submit_read(
-                        &self.inner_tcp.clone(),
-                        &mut self.read_buf,
-                        &mut read_fut,
-                        cx,
-                    ) {
-                        Poll::Ready(res) => match res {
-                            Ok(has_rem) => {
-                                if has_rem {
-                                    continue;
-                                }
-                                break Poll::Ready(Ok(()));
-                            }
-                            Err(e) => {
-                                break Poll::Ready(Err(e));
-                            }
-                        },
-                        Poll::Pending => {
-                            *self.project().read_fut = read_fut;
-                            break Poll::Pending;
-                        }
+                    Err(e) => {
+                        break Poll::Ready(Err(e));
                     }
+                },
+                Poll::Pending => {
+                    let mut slf = self.project();
+                    *slf.read_fut = fut;
+                    break Poll::Pending;
                 }
             }
-            (a, b) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                anyhow::anyhow!("async write flush is busy - buf present={a}, fut present={b}"),
-            ))),
         }
     }
     #[inline]
@@ -486,11 +394,11 @@ async fn try_write_to_stream(
     stream: Rc<tokio_uring::net::TcpStream>,
     bytes: OutgoingWriteBuffer,
 ) -> Result<OutgoingWriteBuffer, std::io::Error> {
-    if bytes.unread_range.is_none() {
+    if !bytes.unwritten() {
         return Ok(bytes);
     }
     let mut buf = bytes.bytes;
-    let mut range = bytes.unread_range.unwrap();
+    let mut range = bytes.unread_range;
     let mut mid = BytesMut::split_off(&mut buf, range.start);
     let end = mid.split_off(range.count);
     let r = stream.write(mid).await;
@@ -499,11 +407,14 @@ async fn try_write_to_stream(
     mid.unsplit(end);
     buf.unsplit(mid);
     let unread_range = if range.count <= written {
-        None
+        UnreadRange {
+            start: 0,
+            count: 0,
+        }
     } else {
         range.count -= written;
         range.start += written;
-        Some(range)
+        range
     };
     Ok(OutgoingWriteBuffer {
         bytes: buf,

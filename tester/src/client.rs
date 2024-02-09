@@ -1,24 +1,22 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::Full;
+use http_test_util::drain::DrainBodyFuture;
 use hyper::header::CONTENT_LENGTH;
 use hyper::Request;
-use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use http_test_util::drain::DrainBodyFuture;
 
 #[derive(Clone)]
 pub struct HttpClient {
     client: Client<HttpConnector, Full<Bytes>>,
 }
 
-impl HttpClient
-{
+impl HttpClient {
     #[must_use]
     pub fn new() -> Self {
-        let client = Client::builder(TokioExecutor::new())
-            .build(HttpConnector::new());
+        let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         Self { client }
     }
 

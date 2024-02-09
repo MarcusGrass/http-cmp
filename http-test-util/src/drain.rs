@@ -1,9 +1,9 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use bytes::Buf;
 use hyper::body::Body;
 use pin_project_lite::pin_project;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 pin_project! {
     pub struct DrainBodyFuture<B: Body> {
@@ -15,8 +15,8 @@ pin_project! {
 }
 
 impl<B> DrainBodyFuture<B>
-    where
-        B: Body,
+where
+    B: Body,
 {
     #[inline]
     #[must_use]
@@ -29,8 +29,8 @@ impl<B> DrainBodyFuture<B>
 }
 
 impl<B> Future for DrainBodyFuture<B>
-    where
-        B: Body,
+where
+    B: Body,
 {
     type Output = Result<Vec<u8>, anyhow::Error>;
 

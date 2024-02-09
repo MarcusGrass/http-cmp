@@ -1,5 +1,5 @@
 use crate::client::HttpClient;
-use crate::scenario::{run};
+use crate::scenario::run;
 
 pub mod client;
 mod scenario;
@@ -16,5 +16,12 @@ fn main() {
 
 async fn run_tester(num_concurrent: usize, num_per_task: usize) {
     let client = HttpClient::new();
-    run(num_concurrent, num_per_task, client, "http://127.0.0.1:8080").await.unwrap();
+    run(
+        num_concurrent,
+        num_per_task,
+        client,
+        "http://127.0.0.1:8080",
+    )
+    .await
+    .unwrap();
 }

@@ -13,8 +13,8 @@ pin_project! {
 }
 
 impl<T> TokioUringIo<T>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
     pub fn new(inner: T) -> Self {
         Self { inner }
@@ -22,8 +22,8 @@ impl<T> TokioUringIo<T>
 }
 
 impl<T> tokio::io::AsyncRead for TokioUringIo<T>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
     #[inline]
     fn poll_read(
@@ -36,8 +36,8 @@ impl<T> tokio::io::AsyncRead for TokioUringIo<T>
 }
 
 impl<T> tokio::io::AsyncWrite for TokioUringIo<T>
-    where
-        T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
     #[inline]
     fn poll_write(
@@ -74,8 +74,8 @@ impl<T> tokio::io::AsyncWrite for TokioUringIo<T>
 }
 
 impl<T> hyper::rt::Read for TokioUringIo<T>
-    where
-        T: tokio::io::AsyncRead,
+where
+    T: tokio::io::AsyncRead,
 {
     #[allow(clippy::similar_names)]
     fn poll_read(
@@ -99,8 +99,8 @@ impl<T> hyper::rt::Read for TokioUringIo<T>
 }
 
 impl<T> hyper::rt::Write for TokioUringIo<T>
-    where
-        T: tokio::io::AsyncWrite,
+where
+    T: tokio::io::AsyncWrite,
 {
     #[inline]
     fn poll_write(

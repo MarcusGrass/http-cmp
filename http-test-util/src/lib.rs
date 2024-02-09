@@ -1,9 +1,9 @@
 pub mod drain;
 
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use http_body_util::Full;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[inline]
 pub fn empty_body() -> Full<Bytes> {
@@ -14,7 +14,6 @@ pub fn empty_body() -> Full<Bytes> {
 pub fn byte_body<B: Into<Bytes>>(bytes: B) -> Full<Bytes> {
     Full::new(bytes.into())
 }
-
 
 #[derive(Clone)]
 pub struct SharedCounter {
@@ -33,19 +32,14 @@ impl SharedCounter {
     #[must_use]
     pub fn increment(&self, num: usize) -> IncrementCounterResponse {
         let prev = self.count.fetch_add(num, Ordering::AcqRel);
-        IncrementCounterResponse {
-            prev,
-        }
+        IncrementCounterResponse { prev }
     }
 
     #[inline]
     #[must_use]
     pub fn swap(&self, cur: usize) -> SwapCounterResponse {
         let prev = self.count.swap(cur, Ordering::AcqRel);
-        SwapCounterResponse {
-            prev,
-            cur,
-        }
+        SwapCounterResponse { prev, cur }
     }
 
     #[inline]
@@ -59,7 +53,7 @@ impl SharedCounter {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IncrementCounterRequest {
-    pub new: usize
+    pub new: usize,
 }
 
 impl IncrementCounterRequest {
@@ -69,7 +63,6 @@ impl IncrementCounterRequest {
     }
 }
 
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IncrementCounterResponse {
     prev: usize,
@@ -77,7 +70,7 @@ pub struct IncrementCounterResponse {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SwapCounterRequest {
-    pub new: usize
+    pub new: usize,
 }
 
 impl SwapCounterRequest {
@@ -86,7 +79,6 @@ impl SwapCounterRequest {
         Self { new }
     }
 }
-
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SwapCounterResponse {

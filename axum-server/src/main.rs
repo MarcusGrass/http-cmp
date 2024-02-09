@@ -1,7 +1,10 @@
 use axum::extract::State;
-use axum::Json;
 use axum::routing::{get, post, put};
-use http_test_util::{GetCounterResponse, IncrementCounterRequest, IncrementCounterResponse, SharedCounter, SwapCounterRequest, SwapCounterResponse};
+use axum::Json;
+use http_test_util::{
+    GetCounterResponse, IncrementCounterRequest, IncrementCounterResponse, SharedCounter,
+    SwapCounterRequest, SwapCounterResponse,
+};
 
 const INDEX_HTML: &[u8] = include_bytes!("../../index.html");
 
@@ -15,7 +18,9 @@ fn main() {
 }
 
 async fn run_server() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+        .await
+        .unwrap();
     let state = SharedCounter::new();
     let router = axum::Router::new()
         .route("/", get(get_index))
@@ -38,11 +43,17 @@ async fn get_count(State(counter): State<SharedCounter>) -> Json<GetCounterRespo
 }
 
 #[inline]
-async fn put_count(State(counter): State<SharedCounter>, Json(incr): Json<IncrementCounterRequest>) -> Json<IncrementCounterResponse> {
+async fn put_count(
+    State(counter): State<SharedCounter>,
+    Json(incr): Json<IncrementCounterRequest>,
+) -> Json<IncrementCounterResponse> {
     Json(counter.increment(incr.new))
 }
 
 #[inline]
-async fn post_count(State(counter): State<SharedCounter>, Json(incr): Json<SwapCounterRequest>) -> Json<SwapCounterResponse> {
+async fn post_count(
+    State(counter): State<SharedCounter>,
+    Json(incr): Json<SwapCounterRequest>,
+) -> Json<SwapCounterResponse> {
     Json(counter.swap(incr.new))
 }
