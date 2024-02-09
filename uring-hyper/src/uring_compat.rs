@@ -25,9 +25,9 @@ where
 pin_project! {
     pub struct UringTcp {
         inner_tcp: Rc<tokio_uring::net::TcpStream>,
-        read_buf: OutgoingBuffers,
+        read_buf: QueueBuffers,
         #[pin]
-        read_fut: Option<Pin<Box<dyn Future<Output=Result<OutgoingWriteBuffer, std::io::Error>>>>>,
+        read_fut: Option<Pin<Box<dyn Future<Output=Result<BytesMut, std::io::Error>>>>>,
         write_buf: Option<BufferedBytesMut>,
         #[pin]
         write_fut: Option<Pin<Box<dyn Future<Output=Result<BufferedBytesMut, std::io::Error>>>>>,
@@ -39,7 +39,7 @@ impl UringTcp {
     pub fn new(inner_tcp: tokio_uring::net::TcpStream, buf_size: usize) -> Self {
         Self {
             inner_tcp: Rc::new(inner_tcp),
-            read_buf: OutgoingBuffers::new(BytesMut::zeroed(buf_size), BytesMut::zeroed(buf_size)),
+            read_buf: QueueBuffers::new(BytesMut::zeroed(buf_size)),
             read_fut: None,
             write_buf: Some(BufferedBytesMut {
                 bytes: BytesMut::zeroed(buf_size),
@@ -116,10 +116,118 @@ impl OutgoingBuffers {
     }
 }
 
-#[derive(Debug)]
-struct QueueBuffer {
-    bytes: BytesMut,
-    written_offset: usize,
+#[derive(Eq, PartialEq)]
+enum OutstandingBuffer {
+    // Buffer to the left of the currently available is outstanding
+    Left,
+    // Buffer to the right of the currently available is outstanding
+    Right,
+    // No buffers outstanding
+    None
+}
+
+struct QueueBuffers {
+    total_size: usize,
+    outstanding: OutstandingBuffer,
+    // Currently available buffer
+    rem_bytes: BytesMut,
+    // Currently available byte range
+    r1: UnreadRange,
+}
+
+impl QueueBuffers {
+    fn new(buffer: BytesMut) -> Self {
+        Self {
+            total_size: buffer.capacity(),
+            outstanding: OutstandingBuffer::None,
+            rem_bytes: buffer,
+            r1: UnreadRange {
+                start: 0,
+                count: 0,
+            },
+        }
+    }
+
+    #[inline]
+    fn cur_buf_capacity(&self) -> usize {
+        self.rem_bytes.len() - self.r1.offset()
+    }
+
+    fn write_into_avail(&mut self, write: &[u8]) -> Option<usize> {
+        let cap = self.cur_buf_capacity();
+        let write_bytes = cap.min(write.len());
+        if write_bytes == 0 {
+            return None;
+        }
+        let start = self.r1.offset();
+        self.rem_bytes.as_mut()[start..start + write_bytes].copy_from_slice(&write[..write_bytes]);
+        self.r1.count += write_bytes;
+        Some(write_bytes)
+    }
+
+    #[inline]
+    fn has_outstanding(&self) -> bool {
+        self.outstanding == OutstandingBuffer::None && self.r1.count == 0
+    }
+
+    fn get_unchecked(&mut self) -> Option<(BytesMut, Option<usize>)> {
+        if self.r1.count == 0 {
+            return None;
+        }
+        match self.outstanding {
+            OutstandingBuffer::Left |
+            OutstandingBuffer::Right => {
+                panic!("Invariant broken, get when already split");
+            }
+            OutstandingBuffer::None => {
+                if self.r1.start == 0 {
+                    // Buffer starts from the left
+                    let rest = self.rem_bytes.split_off(self.r1.offset());
+                    let out = std::mem::replace(&mut self.rem_bytes, rest);
+                    self.outstanding = OutstandingBuffer::Left;
+                    self.r1 = UnreadRange {
+                        start: 0,
+                        count: 0,
+                    };
+                    Some((out, None))
+                } else {
+                    // Buffer starts with a right-offset
+                    let out = self.rem_bytes.split_off(self.r1.offset());
+                    self.outstanding = OutstandingBuffer::Right;
+                    let count = self.r1.count;
+                    self.r1 = UnreadRange {
+                        start: 0,
+                        count: 0,
+                    };
+                    Some((out, Some(count)))
+                }
+            }
+        }
+    }
+
+    fn merge_back(&mut self, mut prev_writing: BytesMut) -> bool {
+        match self.outstanding {
+            OutstandingBuffer::Left => {
+                let tmp = std::mem::take(&mut self.rem_bytes);
+                let prev_len = prev_writing.len();
+                prev_writing.unsplit(tmp);
+                self.rem_bytes = prev_writing;
+                if self.r1.count != 0 {
+                    self.r1.start += prev_len;
+                }
+                self.outstanding = OutstandingBuffer::None;
+                self.r1.count != 0
+            }
+            OutstandingBuffer::Right => {
+                self.rem_bytes.unsplit(prev_writing);
+                self.outstanding = OutstandingBuffer::None;
+                self.r1.count != 0
+            }
+            OutstandingBuffer::None => {
+                panic!("Invariant violated, tried to unsplit an unsplit buffer");
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -167,6 +275,14 @@ struct BufferedBytesMut {
 struct UnreadRange {
     start: usize,
     count: usize,
+}
+
+impl UnreadRange {
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.start + self.count
+    }
 }
 
 impl tokio::io::AsyncRead for UringTcp {
@@ -283,9 +399,9 @@ fn try_write_into_cursor(
 
 fn poll_outgoing(
     tcp: &Rc<tokio_uring::net::TcpStream>,
-    read_buf: &mut OutgoingBuffers,
+    read_buf: &mut QueueBuffers,
     read_fut: &mut Option<
-        Pin<Box<dyn Future<Output = Result<OutgoingWriteBuffer, std::io::Error>>>>,
+        Pin<Box<dyn Future<Output = Result<BytesMut, std::io::Error>>>>,
     >,
     cx: &mut Context<'_>,
 ) -> Poll<Result<bool, Error>> {
@@ -293,8 +409,10 @@ fn poll_outgoing(
         rf
     } else {
         // If no read fut, there should be a ready buffer
-        let buf = read_buf.get_unchecked();
-        Box::pin(try_write_to_stream(tcp.clone(), buf))
+        let Some((bytes, count)) = read_buf.get_unchecked() else {
+            return Poll::Ready(Ok(false));
+        };
+        Box::pin(try_write_to_stream(tcp.clone(), bytes, count))
     };
     let pinned = std::pin::pin!(&mut fut);
     match pinned.poll(cx) {
@@ -362,7 +480,7 @@ impl tokio::io::AsyncWrite for UringTcp {
                 Poll::Ready(res) => match res {
                     Ok(has_rem) => {
                         if has_rem {
-                            continue
+                            continue;
                         }
                         break Poll::Ready(Ok(()));
                     }
@@ -392,32 +510,18 @@ impl tokio::io::AsyncWrite for UringTcp {
 
 async fn try_write_to_stream(
     stream: Rc<tokio_uring::net::TcpStream>,
-    bytes: OutgoingWriteBuffer,
-) -> Result<OutgoingWriteBuffer, std::io::Error> {
-    if !bytes.unwritten() {
-        return Ok(bytes);
-    }
-    let mut buf = bytes.bytes;
-    let mut range = bytes.unread_range;
-    let mut mid = BytesMut::split_off(&mut buf, range.start);
-    let end = mid.split_off(range.count);
-    let r = stream.write(mid).await;
-    let written = r.0?;
-    let mut mid = r.1;
-    mid.unsplit(end);
-    buf.unsplit(mid);
-    let unread_range = if range.count <= written {
-        UnreadRange {
-            start: 0,
-            count: 0,
-        }
+    mut bytes: BytesMut,
+    count: Option<usize>
+) -> Result<BytesMut, std::io::Error> {
+    let (r, rest) = if let Some(count) = count {
+        let rest = BytesMut::split_off(&mut bytes, count);
+        (stream.write(bytes).await, Some(rest))
     } else {
-        range.count -= written;
-        range.start += written;
-        range
+        (stream.write(bytes).await, None)
     };
-    Ok(OutgoingWriteBuffer {
-        bytes: buf,
-        unread_range,
-    })
+    let mut bytes = r.1;
+    if let Some(rest) = rest {
+        bytes.unsplit(rest);
+    }
+    Ok(bytes)
 }

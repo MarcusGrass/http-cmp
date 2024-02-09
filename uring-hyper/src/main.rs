@@ -100,7 +100,7 @@ async fn run_app() {
     let shared_count = SharedCounter::new();
     loop {
         let (tcp, _peer) = sock.accept().await.unwrap();
-        let uring_tcp = TokioUringIo::new(UringTcp::new(tcp, 1024 * 128));
+        let uring_tcp = TokioUringIo::new(UringTcp::new(tcp, 1024 * 64));
         let sc = shared_count.clone();
         tokio_uring::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
             uring_tcp,
