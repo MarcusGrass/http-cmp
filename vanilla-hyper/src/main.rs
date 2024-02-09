@@ -11,7 +11,7 @@ use http_test_util::drain::DrainBodyFuture;
 const INDEX_HTML: &[u8] = include_bytes!("../../index.html");
 
 fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();

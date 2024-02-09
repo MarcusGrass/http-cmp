@@ -6,3 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+http-test-util = { workspace = true }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+mimalloc = { workspace = true }
+pin-project-lite = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"]}
+tokio-uring = { workspace = true }
+serde_json = { workspace = true }

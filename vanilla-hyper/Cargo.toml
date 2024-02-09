@@ -12,5 +12,7 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+
+mimalloc = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"]}
 serde_json = { workspace = true }
