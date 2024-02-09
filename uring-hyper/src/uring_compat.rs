@@ -25,9 +25,9 @@ impl<Fut> Executor<Fut> for TokioUringExecutor
 pin_project! {
     pub struct UringTcp {
         inner_tcp: Rc<tokio_uring::net::TcpStream>,
-        read_buf: Option<BufferedOutgoingBytes>,
+        read_buf: Option<OutgoingWriteBuffer>,
         #[pin]
-        read_fut: Option<Pin<Box<dyn Future<Output=Result<BufferedOutgoingBytes, std::io::Error>>>>>,
+        read_fut: Option<Pin<Box<dyn Future<Output=Result<OutgoingWriteBuffer, std::io::Error>>>>>,
         write_buf: Option<BufferedBytesMut>,
         #[pin]
         write_fut: Option<Pin<Box<dyn Future<Output=Result<BufferedBytesMut, std::io::Error>>>>>,
@@ -39,7 +39,7 @@ impl UringTcp {
     pub fn new(inner_tcp: tokio_uring::net::TcpStream, buf_size: usize) -> Self {
         Self {
             inner_tcp: Rc::new(inner_tcp),
-            read_buf: Some(BufferedOutgoingBytes {
+            read_buf: Some(OutgoingWriteBuffer {
                 bytes: BytesMut::zeroed(buf_size),
                 unread_range: None,
             }),
@@ -53,19 +53,111 @@ impl UringTcp {
     }
 }
 
+struct OutgoingBuffers {
+    // Missing if currently writing to stream
+    writing: Option<OutgoingWriteBuffer>,
+    // Always present but can be full
+    buffer: OutgoingWriteBuffer,
+}
+
+impl OutgoingBuffers {
+    fn new(left: BytesMut, right: BytesMut) -> Self {
+        Self {
+            writing: Some(OutgoingWriteBuffer {
+                bytes: left,
+                unread_range: None,
+            }),
+            buffer: OutgoingWriteBuffer {
+                bytes: right,
+                unread_range: None,
+            },
+        }
+    }
+
+    fn write_into_avail(&mut self, write: &[u8]) -> Option<usize> {
+        // Has space in right, to preserve order, bytes need to be written into there
+        if !self.buffer.unwritten() {
+            let written = self.buffer.copy_into(write);
+            if written == 0 {
+                return None;
+            }
+            return Some(written);
+        }
+        if let Some(active) = &mut self.writing {
+            // Active buffer is not busy and passive buffer has nothing in it, extend
+            let written = active.copy_into(write);
+            if written == 0 {
+                return None;
+            }
+            return Some(written);
+
+        }
+        None
+    }
+
+    fn get_unchecked(&mut self) -> OutgoingWriteBuffer {
+        self.writing.take().unwrap()
+    }
+
+    fn merge_back(&mut self, prev_writing: OutgoingWriteBuffer) {
+        if prev_writing.unwritten() {
+            // Did not manage to write the old buffer completely
+            self.writing = Some(prev_writing);
+        } else {
+            // Managed to write the old buffer completely, swap in the waiting one
+            let new_writing = std::mem::replace(&mut self.buffer, prev_writing);
+            self.writing = Some(new_writing);
+        }
+    }
+}
+
 #[derive(Debug)]
-struct BufferedOutgoingBytes {
+struct QueueBuffer {
+    bytes: BytesMut,
+    written_offset: usize,
+}
+
+#[derive(Debug)]
+struct OutgoingWriteBuffer {
     bytes: BytesMut,
     unread_range: Option<UnreadRange>,
 }
 
-impl BufferedOutgoingBytes {
+impl OutgoingWriteBuffer {
     #[inline]
     fn unwritten(&self) -> bool {
         self.unread_range
             .as_ref()
             .map(|r| r.count > 0)
             .unwrap_or_default()
+    }
+
+    #[inline]
+    fn avail_space(&self) -> usize {
+        self.unread_range
+            .as_ref()
+            .map(|r| self.bytes.len() - (r.start + r.count))
+            .unwrap_or_else(|| self.bytes.len())
+    }
+
+    #[inline]
+    fn space_end(&self) -> usize {
+        self.unread_range
+            .as_ref()
+            .map(|r| r.start + r.count)
+            .unwrap_or_default()
+    }
+
+    fn copy_into(&mut self, source: &[u8]) -> usize {
+        let end = self.space_end();
+        if end < self.bytes.len() - 1 {
+            let space = self.bytes.len() - end;
+            let to_write = space.min(source.len());
+            self.bytes.as_mut()[end..end + to_write].copy_from_slice(&source[..to_write]);
+            to_write
+        } else {
+            0
+        }
     }
 }
 
@@ -194,8 +286,8 @@ fn try_write_into_cursor(
 
 fn submit_read(
     tcp: &Rc<tokio_uring::net::TcpStream>,
-    read_buf: &mut Option<BufferedOutgoingBytes>,
-    read_fut: &mut Option<Pin<Box<dyn Future<Output = Result<BufferedOutgoingBytes, std::io::Error>>>>>,
+    read_buf: &mut Option<OutgoingWriteBuffer>,
+    read_fut: &mut Option<Pin<Box<dyn Future<Output = Result<OutgoingWriteBuffer, std::io::Error>>>>>,
     cx: &mut Context<'_>,
 ) -> Poll<Result<bool, Error>> {
     if read_fut.is_none() {
@@ -392,8 +484,8 @@ impl tokio::io::AsyncWrite for UringTcp {
 
 async fn try_write_to_stream(
     stream: Rc<tokio_uring::net::TcpStream>,
-    bytes: BufferedOutgoingBytes,
-) -> Result<BufferedOutgoingBytes, std::io::Error> {
+    bytes: OutgoingWriteBuffer,
+) -> Result<OutgoingWriteBuffer, std::io::Error> {
     if bytes.unread_range.is_none() {
         return Ok(bytes);
     }
@@ -413,7 +505,7 @@ async fn try_write_to_stream(
         range.start += written;
         Some(range)
     };
-    Ok(BufferedOutgoingBytes {
+    Ok(OutgoingWriteBuffer {
         bytes: buf,
         unread_range,
     })
